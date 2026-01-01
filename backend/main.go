@@ -2,72 +2,278 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
+	"sync"
 	"time"
 )
 
-// Global cache for heavy tasks (disk usage)
-var cachedDiskInfo DiskStats
+var Version = "dev"
+var BuildTime = "unknown"
+var AllowDev = "true"
 
+// --- Global Variables ---
+var (
+	dataMutex      sync.RWMutex
+	globalStats    SystemStats
+	lastAccessTime time.Time
+	isIdle         bool
+	idleMutex      sync.RWMutex
+)
+
+// --- Data Structures ---
+type SystemStats struct {
+	System  SystemInfo    `json:"system"`
+	CPU     CPUStats      `json:"cpu"`
+	RAM     RAMStats      `json:"ram"`
+	GPU     GPUStats      `json:"gpu"`
+	GPUs    []GPUStatsSeq `json:"gpus"`
+	Disk    DiskStats     `json:"disk"`
+	History HistoryStats  `json:"history"`
+	Updated string        `json:"updated"`
+}
+
+type HistoryStats struct {
+	CPULoad []int `json:"cpuLoad"`
+	GPULoad []int `json:"gpuLoad"`
+	RAMLoad []int `json:"ramLoad"`
+}
+
+// --- Main Function ---
 func main() {
-	// 1. 初始化静态硬件信息 (CPU型号、线程数等)
-	InitStaticHardwareInfo()
+	// Check command line args
+	showVersion := flag.Bool("version", false, "Show version info")
+	flag.Parse()
 
-	// 2. 启动后台协程：定期扫描用户磁盘占用 (重型任务，每 5 分钟一次)
+	if *showVersion {
+		fmt.Println(Version)
+		return
+	}
+
+	// Determine paths based on mode
+	var devMode = false
+	configPath := ConfigPath
+	if AllowDev == "true" && len(os.Args) > 1 && os.Args[1] == "dev" {
+		devMode = true
+		configPath = "../dev/config.json"
+		fmt.Printf("Using Dev Config Path: %s\n", configPath)
+	}
+
+	// 0. Load Config
+	LoadConfig(configPath)
+
+	fmt.Printf("Initializing %s Backend (%s)...\n", globalConfig.ProjectName, Version)
+	fmt.Printf("Paths: Dist=%s, Docs=%s\n", DistPath, globalConfig.DocsPath)
+	fmt.Printf("Monitor: CRG=%ds/%ds, Disk=%.1fh/%.1fh, Idle=%ds\n",
+		globalConfig.Monitor.IntervalCRG, globalConfig.Monitor.IdleIntervalCRG,
+		globalConfig.Monitor.IntervalDisk, globalConfig.Monitor.IdleIntervalDisk,
+		globalConfig.Monitor.IdleTimeout)
+
+	// 1. Initialize Data
+	globalStats.System = GetStaticSystemInfo()
+	globalStats.History = HistoryStats{
+		CPULoad: make([]int, globalConfig.Monitor.HistoryCPU),
+		GPULoad: make([]int, globalConfig.Monitor.HistoryGPU),
+		RAMLoad: make([]int, globalConfig.Monitor.HistoryRAM),
+	}
+	// Initialize as active
+	lastAccessTime = time.Now()
+	isIdle = false
+
+	// Cleanup NVML on exit
+	defer ShutdownNVML()
+
+	// 2. Start High-Frequency Monitoring (CRG: CPU, RAM, GPU) with adaptive interval
 	go func() {
-		for {
-			fmt.Println("⏳ Starting background disk scan...")
-			cachedDiskInfo = GetDiskUsage() // 来自 monitor_disk.go
-			fmt.Println("✅ Disk scan completed.")
-			time.Sleep(5 * time.Hour)
+		currentInterval := time.Duration(globalConfig.Monitor.IntervalCRG) * time.Second
+		ticker := time.NewTicker(currentInterval)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			// Determine current state based on last access time (single source of truth)
+			idleMutex.RLock()
+			timeSinceAccess := time.Since(lastAccessTime)
+			idleMutex.RUnlock()
+
+			// Check if IdleTimeout is 0 (never idle)
+			idleTimeout := time.Duration(globalConfig.Monitor.IdleTimeout) * time.Second
+			shouldBeIdle := idleTimeout > 0 && timeSinceAccess > idleTimeout
+
+			// Update idle state and adjust interval if needed
+			idleMutex.Lock()
+			wasIdle := isIdle
+			isIdle = shouldBeIdle
+			idleMutex.Unlock()
+
+			// Handle state transitions
+			if wasIdle != shouldBeIdle {
+				if shouldBeIdle {
+					fmt.Printf("[Monitor] State: Active → Idle (no activity for %ds)\n", globalConfig.Monitor.IdleTimeout)
+				} else {
+					fmt.Printf("[Monitor] State: Idle → Active (new connection detected)\n")
+				}
+
+				var newInterval time.Duration
+				if shouldBeIdle {
+					newInterval = time.Duration(globalConfig.Monitor.IdleIntervalCRG) * time.Second
+				} else {
+					newInterval = time.Duration(globalConfig.Monitor.IntervalCRG) * time.Second
+				}
+
+				if newInterval != currentInterval {
+					fmt.Printf("[Monitor] CRG interval changed: %ds → %ds\n", int(currentInterval.Seconds()), int(newInterval.Seconds()))
+					ticker.Reset(newInterval)
+					currentInterval = newInterval
+				}
+			}
+
+			updateRealTimeStats()
 		}
 	}()
 
-	// 3. 配置 API 路由
-	http.HandleFunc("/api/stats", handleStats)
+	// 3. Start Low-Frequency Monitoring (Disk) with adaptive interval
+	go func() {
+		updateDiskStats()
 
-	// 4. 配置静态文件服务 (前端页面)
-	distPath := "../dist" // 假设 dist 在上级目录，或者你可以改为 "./dist"
-	if _, err := os.Stat(distPath); !os.IsNotExist(err) {
-		fs := http.FileServer(http.Dir(distPath))
+		// Helper to get interval based on idle state
+		getInterval := func(idle bool) time.Duration {
+			var interval time.Duration
+			if idle {
+				interval = time.Duration(globalConfig.Monitor.IdleIntervalDisk * float64(time.Hour))
+			} else {
+				interval = time.Duration(globalConfig.Monitor.IntervalDisk * float64(time.Hour))
+			}
+			return max(interval, 5*time.Minute)
+		}
+
+		currentInterval := getInterval(false)
+		ticker := time.NewTicker(currentInterval)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			// Check current idle state and adjust interval if needed
+			idleMutex.RLock()
+			currentIdleState := isIdle
+			idleMutex.RUnlock()
+
+			newInterval := getInterval(currentIdleState)
+			if newInterval != currentInterval {
+				fmt.Printf("[Monitor] Disk interval changed: %.1fh → %.1fh\n",
+					currentInterval.Hours(), newInterval.Hours())
+				currentInterval = newInterval
+				ticker.Reset(currentInterval)
+			}
+
+			updateDiskStats()
+		}
+	}()
+
+	// 4. Configure Web Routes
+	http.HandleFunc("/api/stats", handleStats)
+	http.HandleFunc("/api/config", handleConfig)
+	http.HandleFunc("/api/docs/tree", handleDocsTree)
+	http.HandleFunc("/api/docs/content", handleDocsContent)
+
+	// 5. Configure Frontend Static Files
+	// In dev mode, allow skipping frontend file check
+	if devMode {
+		fmt.Printf("Dev Mode: Skipping frontend file check (DistPath: %s)\n", DistPath)
+	} else {
+		if _, err := os.Stat(DistPath); os.IsNotExist(err) {
+			fmt.Printf("[Error] Frontend directory not found '%s'\n", DistPath)
+			os.Exit(1)
+		}
+
+		fs := http.FileServer(http.Dir(DistPath))
 		http.Handle("/", fs)
-		fmt.Printf("✅ Serving frontend from %s\n", distPath)
+		fmt.Printf("Frontend loaded: %s\n", DistPath)
 	}
 
-	// 5. 启动服务
-	port := "8000"
-	fmt.Printf("\n🚀 Hipp0 Backend running at http://localhost:%s\n", port)
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
-		fmt.Printf("Error: %s\n", err)
+	// 6. Configure Docs File Server (Optional)
+	docsPath := globalConfig.DocsPath
+
+	if docsPath != "" {
+		if _, err := os.Stat(docsPath); os.IsNotExist(err) {
+			fmt.Printf("[warn] Docs directory not found: %s\n", docsPath)
+		} else {
+			// Mount raw docs directory (for assets/images)
+			http.Handle("/raw/", http.StripPrefix("/raw/", http.FileServer(http.Dir(docsPath))))
+			fmt.Printf("Raw Assets Server started: %s -> /raw/\n", docsPath)
+		}
+	} else {
+		fmt.Printf("[warn] DocsPath not configured\n")
+	}
+
+	// 7. Start Server
+	serverAddr := fmt.Sprintf(":%d", globalConfig.Port)
+	fmt.Printf("Server running at: http://localhost:%d\n", globalConfig.Port)
+	if err := http.ListenAndServe(serverAddr, nil); err != nil {
+		fmt.Printf("Startup failed: %s\n", err)
 	}
 }
 
+func updateRealTimeStats() {
+	cpu := GetCPURealTime()
+	ram := GetRAMRealTime()
+	gpu, gpus := GetGPURealTime()
+
+	dataMutex.Lock()
+	defer dataMutex.Unlock()
+
+	globalStats.CPU = cpu
+	globalStats.RAM = ram
+	globalStats.GPU = gpu
+	globalStats.GPUs = gpus
+	globalStats.Updated = time.Now().Format("15:04:05")
+	globalStats.System.Uptime = GetUptime()
+	globalStats.System.LoadAvg = GetLoadAvg()
+
+	// Update History (FIFO Queue)
+	updateHistory := func(queue []int, val int) []int {
+		return append(queue[1:], val)
+	}
+
+	globalStats.History.CPULoad = updateHistory(globalStats.History.CPULoad, cpu.Load)
+	globalStats.History.RAMLoad = updateHistory(globalStats.History.RAMLoad, int(ram.Used/ram.Total*100))
+	globalStats.History.GPULoad = updateHistory(globalStats.History.GPULoad, gpu.AvgUtil)
+}
+
+func updateDiskStats() {
+	disk := GetDiskUsage()
+
+	dataMutex.Lock()
+	defer dataMutex.Unlock()
+	globalStats.Disk = disk
+}
+
 func handleStats(w http.ResponseWriter, r *http.Request) {
-	// CORS header for development
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Content-Type", "application/json")
 
-	// 获取实时数据 (CPU/RAM/GPU)
-	realTimeData := GetRealTimeStats() // 来自 monitor_core.go
+	// Update last access time (let CRG goroutine handle state transition)
+	idleMutex.Lock()
+	wasIdle := isIdle
+	lastAccessTime = time.Now()
+	idleMutex.Unlock()
 
-	// 组合数据：实时数据 + 缓存的磁盘数据
-	response := struct {
-		CPU     CPUStats   `json:"cpu"`
-		RAM     RAMStats   `json:"ram"`
-		GPUs    []GPUStats `json:"gpus"`
-		Disk    DiskStats  `json:"disk"`
-		Uptime  string     `json:"uptime"`
-		Updated string     `json:"updated"`
-	}{
-		CPU:     realTimeData.CPU,
-		RAM:     realTimeData.RAM,
-		GPUs:    realTimeData.GPUs,
-		Disk:    cachedDiskInfo, // 使用缓存的磁盘数据，防止卡顿
-		Uptime:  realTimeData.Uptime,
-		Updated: time.Now().Format("15:04:05"),
+	// If currently idle, refresh data immediately for accurate stats
+	if wasIdle {
+		updateRealTimeStats()
+		updateDiskStats()
 	}
 
-	json.NewEncoder(w).Encode(response)
+	dataMutex.RLock()
+	defer dataMutex.RUnlock()
+
+	json.NewEncoder(w).Encode(globalStats)
+}
+
+func handleConfig(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Content-Type", "application/json")
+
+	json.NewEncoder(w).Encode(globalConfig)
 }

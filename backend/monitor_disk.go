@@ -2,6 +2,7 @@ package main
 
 import (
 	"os/exec"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -16,9 +17,10 @@ type Partition struct {
 
 type UserUsage struct {
 	Name string  `json:"name"`
-	Used float64 `json:"used"` // GB
+	Used float64 `json:"used"`
 }
 
+// DiskStats contains aggregated disk usage information
 type DiskStats struct {
 	Total      float64     `json:"total"`
 	Used       float64     `json:"used"`
@@ -26,22 +28,21 @@ type DiskStats struct {
 	Users      []UserUsage `json:"users"`
 }
 
-// 执行完整的磁盘扫描
+// GetDiskUsage returns current disk usage statistics
+// Scans configured partitions and user home directories
 func GetDiskUsage() DiskStats {
 	stats := DiskStats{}
-
-	// 1. 获取分区信息 (df)
+	// Get partitions, keeping only /home (if independent) and root /
+	// This avoids showing too many irrelevant tmpfs
 	stats.Partitions, stats.Total, stats.Used = getPartitions()
-
-	// 2. 获取用户目录占用 (du)
-	// 警告：这个操作在有很多文件的服务器上会很慢，不要高频调用
 	stats.Users = getUserUsage("/home")
-
 	return stats
 }
 
+// getPartitions scans file system partitions using df command
+// Returns only partitions configured in includedPartitions
 func getPartitions() ([]Partition, float64, float64) {
-	cmd := exec.Command("df", "-B1") // Bytes
+	cmd := exec.Command("df", "-B1")
 	out, err := cmd.Output()
 	if err != nil {
 		return []Partition{}, 0, 0
@@ -52,11 +53,8 @@ func getPartitions() ([]Partition, float64, float64) {
 
 	lines := strings.Split(string(out), "\n")
 
-	// 定义我们关心的挂载点及其显示标签
-	targets := map[string]string{
-		"/":     "System",
-		"/home": "Users",
-	}
+	// Use partition list from config
+	targets := globalConfig.Disk.IncludedPartitions
 
 	for _, line := range lines {
 		fields := strings.Fields(line)
@@ -64,6 +62,12 @@ func getPartitions() ([]Partition, float64, float64) {
 			continue
 		}
 		mount := fields[5]
+
+		// Check if in ignore list
+		isIgnored := slices.Contains(globalConfig.Disk.IgnoredPartitions, mount)
+		if isIgnored {
+			continue
+		}
 
 		if label, ok := targets[mount]; ok {
 			totalBytes, _ := strconv.ParseFloat(fields[1], 64)
@@ -79,6 +83,7 @@ func getPartitions() ([]Partition, float64, float64) {
 				Used:  usedGB,
 			})
 
+			// Accumulate all configured partitions to get system total
 			totalSystem += totalGB
 			usedSystem += usedGB
 		}
@@ -86,25 +91,19 @@ func getPartitions() ([]Partition, float64, float64) {
 	return parts, totalSystem, usedSystem
 }
 
+// getUserUsage scans user home directories using du command
+// Returns top users by disk usage, respecting ignoredUsers and maxUsersToList
 func getUserUsage(basePath string) []UserUsage {
-	// 使用 du -s /home/* 命令
-	// 注意：这需要 backend 运行用户有读取 /home 下其他用户目录的权限 (通常需要 root)
-	// 如果没有权限，只能看到自己的或报错。
-	cmd := exec.Command("du", "-s", "-B1", basePath+"/*")
-	// 为了防止通配符无法展开，实际上最好用 shell 运行，或者列出目录再 du
-	// 这里用更安全的方式：列出目录 -> 循环 du (或者直接 du -d 1)
-
-	// 修正：使用 du -d 1 -B1 /home
-	cmd = exec.Command("du", "-d", "1", "-B1", basePath)
+	cmd := exec.Command("du", "-d", "1", "-B1", basePath)
 	out, err := cmd.Output()
 	if err != nil {
 		return []UserUsage{}
 	}
 
 	var users []UserUsage
-	lines := strings.Split(string(out), "\n")
+	lines := strings.SplitSeq(string(out), "\n")
 
-	for _, line := range lines {
+	for line := range lines {
 		fields := strings.Fields(line)
 		if len(fields) < 2 {
 			continue
@@ -113,13 +112,17 @@ func getUserUsage(basePath string) []UserUsage {
 		sizeBytes, _ := strconv.ParseFloat(fields[0], 64)
 		path := fields[1]
 
-		// 获取用户名 (路径的最后一部分)
 		parts := strings.Split(path, "/")
 		name := parts[len(parts)-1]
 
 		if path == basePath {
 			continue
-		} // 跳过汇总行 /home
+		}
+
+		isIgnored := slices.Contains(globalConfig.Disk.IgnoredUsers, name)
+		if isIgnored {
+			continue
+		}
 
 		users = append(users, UserUsage{
 			Name: name,
@@ -127,19 +130,19 @@ func getUserUsage(basePath string) []UserUsage {
 		})
 	}
 
-	// 排序：按使用量从大到小
 	sort.Slice(users, func(i, j int) bool {
 		return users[i].Used > users[j].Used
 	})
 
-	// 只取前 10 名
-	if len(users) > 10 {
-		users = users[:10]
+	// Use max list size from config
+	maxList := globalConfig.Disk.MaxUsersToList
+	if maxList > 0 && len(users) > maxList {
+		users = users[:maxList]
 	}
 
 	return users
 }
 
 func toGB(bytes float64) float64 {
-	return float64(int(bytes/(1024*1024*1024)*10)) / 10.0
+	return float64(int(bytes/BytesToGB*10)) / 10.0
 }

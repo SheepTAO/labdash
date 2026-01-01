@@ -1,0 +1,22 @@
+[Unit]
+Description=LabDash - Lab Monitoring and Documentation System
+Documentation=https://github.com/yourusername/labdash
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/labdash
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=labdash
+
+# Security hardening (limited due to need for system monitoring)
+# Note: Requires root access to read all users' home directories and system stats
+PrivateTmp=true
+ReadWritePaths=/etc/labdash
+
+[Install]
+WantedBy=multi-user.target

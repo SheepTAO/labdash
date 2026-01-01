@@ -1,0 +1,121 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+)
+
+type Config struct {
+	ProjectName string `json:"projectName"`
+	LabName     string `json:"labName"`
+	Port        int    `json:"port"`       // Server port
+	DocsPath    string `json:"docsPath"`   // User configurable source doc
+	DocsDepth   int    `json:"docsDepth"`  // Max depth for docs tree
+	DefaultDoc  string `json:"defaultDoc"` // Default document to load as homepage
+	Monitor     struct {
+		IntervalCRG      int     `json:"intervalCRGSec"`        // CPU, RAM, GPU (seconds)
+		IntervalDisk     float64 `json:"intervalDiskHours"`     // Disk (hours)
+		IdleTimeout      int     `json:"idleTimeoutSec"`        // Idle mode timeout (seconds)
+		IdleIntervalCRG  int     `json:"idleIntervalCRGSec"`    // CRG interval when idle (seconds)
+		IdleIntervalDisk float64 `json:"idleIntervalDiskHours"` // Disk interval when idle (hours)
+		HistoryCPU       int     `json:"historyCPU"`
+		HistoryGPU       int     `json:"historyGPU"`
+		HistoryRAM       int     `json:"historyRAM"`
+	} `json:"monitor"`
+	Disk struct {
+		IncludedPartitions map[string]string `json:"includedPartitions"` // Path -> Label
+		IgnoredPartitions  []string          `json:"ignoredPartitions"`
+		IgnoredUsers       []string          `json:"ignoredUsers"`
+		MaxUsersToList     int               `json:"maxUsersToList"`
+	} `json:"disk"`
+}
+
+var globalConfig Config
+
+func LoadConfig(configPath string) {
+	// 1. Set Default Values
+	globalConfig.ProjectName = "LabDash"
+	globalConfig.LabName = "Lab Dashboard"
+	globalConfig.Port = 8088                     // Default port 8088
+	globalConfig.DocsPath = "/home/labdash/docs" // Default docs folder
+	globalConfig.DocsDepth = 4                   // Default depth 4
+	globalConfig.DefaultDoc = "index.md"         // Default homepage
+	globalConfig.Monitor.IntervalCRG = 2         // 2 seconds
+	globalConfig.Monitor.IntervalDisk = 1        // 1 hour
+	// Idle mode: reduces monitoring frequency when inactive to save resources
+	globalConfig.Monitor.IdleTimeout = 60      // 60 seconds idle timeout (0 = never idle)
+	globalConfig.Monitor.IdleIntervalCRG = 300 // 300 seconds when idle
+	globalConfig.Monitor.IdleIntervalDisk = 6  // 6 hours when idle
+	globalConfig.Monitor.HistoryCPU = 20
+	globalConfig.Monitor.HistoryGPU = 20
+	globalConfig.Monitor.HistoryRAM = 20
+	globalConfig.Disk.IncludedPartitions = map[string]string{
+		"/":     "System Root",
+		"/home": "User Home",
+	}
+	globalConfig.Disk.IgnoredUsers = []string{"lost+found"}
+	globalConfig.Disk.MaxUsersToList = 12
+
+	// 2. Try to read config file
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		fmt.Printf("[warn] Config file not found at %s, using defaults\n", configPath)
+		return
+	}
+
+	file, err := os.ReadFile(configPath)
+	if err != nil {
+		fmt.Printf("[warn] Failed to read config file: %v, using defaults\n", err)
+		return
+	}
+
+	// 3. Parse JSON
+	err = json.Unmarshal(file, &globalConfig)
+	if err != nil {
+		fmt.Printf("[error] Failed to parse config file: %v, using defaults\n", err)
+		return
+	}
+
+	// 4. Validate and apply constraints
+	validateInt := func(name string, value *int, min, max int) {
+		if *value <= min {
+			fmt.Printf("[warn] %s (%d) too small, using minimum %d\n", name, *value, min)
+			*value = min
+		} else if *value >= max {
+			fmt.Printf("[warn] %s (%d) too large, using maximum %d\n", name, *value, max)
+			*value = max
+		}
+	}
+
+	validateFloat := func(name string, value *float64, min, max float64) {
+		if *value <= min {
+			fmt.Printf("[warn] %s (%.2f) too small, using minimum %.2f\n", name, *value, min)
+			*value = min
+		} else if *value >= max {
+			fmt.Printf("[warn] %s (%.2f) too large, using maximum %.2f\n", name, *value, max)
+			*value = max
+		}
+	}
+
+	// Monitor intervals
+	validateInt("IntervalCRG", &globalConfig.Monitor.IntervalCRG, 1, 60)
+	validateFloat("IntervalDisk", &globalConfig.Monitor.IntervalDisk, 0.1, 24)
+
+	// Idle timeout
+	if globalConfig.Monitor.IdleTimeout < 10 {
+		fmt.Printf("[warn] IdleTimeout (%d) cannot be < 10, using 0 (never idle)\n", globalConfig.Monitor.IdleTimeout)
+		globalConfig.Monitor.IdleTimeout = 0
+	} else {
+		validateInt("IdleTimeout", &globalConfig.Monitor.IdleTimeout, 10, 3600)
+	}
+	validateInt("IdleIntervalCRG", &globalConfig.Monitor.IdleIntervalCRG, 10, 600)
+	validateFloat("IdleIntervalDisk", &globalConfig.Monitor.IdleIntervalDisk, 0.5, 48)
+
+	// History sizes
+	validateInt("HistoryCPU", &globalConfig.Monitor.HistoryCPU, 5, 100)
+	validateInt("HistoryGPU", &globalConfig.Monitor.HistoryGPU, 5, 100)
+	validateInt("HistoryRAM", &globalConfig.Monitor.HistoryRAM, 5, 100)
+
+	// Disk config
+	validateInt("MaxUsersToList", &globalConfig.Disk.MaxUsersToList, 1, 50)
+}

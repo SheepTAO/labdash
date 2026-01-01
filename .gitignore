@@ -1,0 +1,17 @@
+# Build output
+build/
+release/
+
+# Development/test directories
+dev/
+
+# Environment and config files
+.env
+*.log
+
+# IDE and editor files
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
